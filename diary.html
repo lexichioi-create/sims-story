@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>모든 심의 대화 · 심즈 일기</title>
+<style>
+:root{color-scheme:dark;--bg:#191b22;--line:#363946;--ink:#ecedf3;--muted:#acafbd}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;background:var(--bg);color:var(--ink);font:15px/1.55 "Pretendard","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif}
+header{flex:none;padding:12px 15px 10px;border-bottom:1px solid var(--line)}
+.title{display:flex;align-items:baseline;gap:10px}
+h1{font-size:18px;margin:0}.count,time,.room{color:var(--muted);font-size:12px}
+.controls{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+select{min-width:0;max-width:100%;padding:4px 7px;border:1px solid var(--line);border-radius:6px;background:#232632;color:var(--ink);font:inherit;font-size:13px}
+.list{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:2px 15px 10px;overflow-anchor:none}
+.line{padding:8px 0;border-bottom:1px solid #2a2d37}.line:last-child{border-bottom:0}
+.meta{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.who{font-weight:650;color:#dfdefe}.dm .who{color:#f5b8d4}.group .who{color:#a1ded5}
+time{margin-left:auto;font-variant-numeric:tabular-nums}.text{margin:2px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.line img{display:block;max-width:min(240px,100%);max-height:220px;border-radius:6px;margin-top:5px}
+.line audio{width:min(280px,100%);display:block;margin-top:5px}.status{color:var(--muted);margin:14px 0}
+@media(max-width:440px){header{padding:9px 10px}.list{padding:1px 10px 8px}.controls{gap:4px}select{padding:4px;font-size:12px}}
+</style>
+</head>
+<body>
+<header>
+  <div class="title"><h1>모든 심의 대화</h1><span id="count" class="count"></span></div>
+  <div class="controls">
+    <select id="date" aria-label="기록 날짜"><option value="">최근 날짜</option></select>
+    <select id="kind" aria-label="대화 종류" hidden>
+      <option value="">모든 대화</option><option value="field">현장 대화</option>
+      <option value="dm">개인톡</option><option value="group">단톡</option>
+    </select>
+    <select id="person" aria-label="말한 심"><option value="">모든 심</option></select>
+  </div>
+</header>
+<main id="list" class="list" aria-label="시간순 대화" tabindex="0"><p class="status">대화를 불러오는 중이에요.</p></main>
+<script>
+'use strict';
+const date = document.getElementById('date');
+const kind = document.getElementById('kind');
+const person = document.getElementById('person');
+const list = document.getElementById('list');
+const count = document.getElementById('count');
+const localDiary = location.pathname === '/diary' || location.pathname === '/diary/';
+kind.hidden = !localDiary;
+const labels = {field:'현장 대화', dm:'개인톡', group:'단톡'};
+let rows = [], activeDay = '', version = '', sequence = 0, loading = false, loaded = false;
+
+function node(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text) el.textContent = text;
+  return el;
+}
+function fillSelect(select, first, groups) {
+  const previous = select.value;
+  select.replaceChildren(new Option(first, ''), ...groups.map(([value, label]) => new Option(label, value)));
+  if (groups.some(([value]) => value === previous)) select.value = previous;
+}
+function draw(scrollEnd) {
+  const scroll = list.scrollTop;
+  const fragment = document.createDocumentFragment();
+  let total = 0;
+  for (const row of rows) {
+    const source = row.kind || 'field';
+    if ((kind.value && source !== kind.value) || (person.value && (row.sid || row.who) !== person.value)) continue;
+    total++;
+    const line = node('article', 'line ' + source);
+    const meta = node('div', 'meta');
+    meta.append(node('span','who',row.who));
+    const label = source === 'dm' && row.room ? '개인톡 · ' + row.room : labels[source];
+    if (localDiary) meta.append(node('span', 'room', (row.notice ? '공지 · ' : '') + label));
+    const clock = node('time', '', row.time);
+    clock.title = (row.saved ? '대화 저장 시각' : '기록 시각') +
+      (row.gt ? ' · 게임 ' + (row.gd == null ? '' : row.gd + '일 ') + row.gt : '');
+    meta.append(clock);
+    line.append(meta, node('p', 'text', row.text));
+    if (localDiary && row.img) {
+      const img = node('img'); img.loading = 'lazy'; img.alt = '대화에 첨부한 사진';
+      img.src = '/photo/' + encodeURIComponent(row.img); line.append(img);
+    }
+    if (localDiary && row.voice) {
+      const voice = node('audio'); voice.controls = true; voice.preload = 'none';
+      voice.src = '/voice/' + encodeURIComponent(row.voice); line.append(voice);
+    }
+    fragment.append(line);
+  }
+  if (!total) fragment.append(node('p','status','이 조건에 맞는 대화가 없어요.'));
+  list.replaceChildren(fragment);
+  count.textContent = total.toLocaleString('ko-KR') + '줄';
+  list.scrollTop = scrollEnd ? list.scrollHeight : scroll;
+}
+async function getJson(url) {
+  const response = await fetch(url, {cache:'no-store'});
+  if (!response.ok) throw new Error('HTTP ' + response.status);
+  return response.json();
+}
+async function reload(force = false) {
+  if (loading && !force) return;
+  const ticket = ++sequence;
+  loading = true;
+  try {
+    let dates, day, lines, revision;
+    if (localDiary) {
+      const headers = !force && version ? {'If-None-Match':version} : {};
+      const response = await fetch('/diary/data?date=' + encodeURIComponent(date.value), {cache:'no-store', headers});
+      if (response.status === 304 || ticket !== sequence) return;
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const data = await response.json();
+      dates = data.dates; day = data.day; lines = data.lines;
+      revision = response.headers.get('ETag');
+    } else {
+      const index = await getJson('diary/dates.json');
+      dates = Object.keys(index).sort().reverse();
+      day = date.value && index[date.value] ? date.value : (dates[0] || '');
+      revision = JSON.stringify(index) + '/' + day;
+      if (ticket !== sequence || (!force && loaded && revision === version)) return;
+      lines = day ? await getJson('diary/' + day + '.json?v=' + encodeURIComponent(index[day])) : [];
+    }
+    if (ticket !== sequence) return;
+    const followEnd = force || !loaded || activeDay !== day || list.scrollHeight - list.clientHeight - list.scrollTop < 60;
+    fillSelect(date, dates.length ? '최근 · ' + dates[0] : '최근 날짜', dates.map(d => [d,d]));
+    const people = new Map(lines.map(row => [row.sid || row.who, row.who]));
+    fillSelect(person, '모든 심', [...people].sort((a,b) => a[1].localeCompare(b[1],'ko')));
+    rows = lines; activeDay = day; loaded = true; version = revision;
+    draw(followEnd);
+  } catch (error) {
+    if (ticket === sequence && !loaded) list.replaceChildren(node('p','status','대화를 불러오지 못했어요. 잠시 후 다시 확인할게요.'));
+  } finally {
+    if (ticket === sequence) loading = false;
+  }
+}
+date.onchange = () => reload(true);
+kind.onchange = person.onchange = () => draw(true);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) reload(); });
+document.addEventListener('keydown', e => {
+  if (window.parent !== window && (e.key === 'Escape' || e.key === 'F9')) {
+    e.preventDefault(); window.parent.postMessage('sims-diary-back','*');
+  }
+});
+reload();
+setInterval(() => { if (!document.hidden) reload(); }, localDiary ? 5000 : 60000);
+</script>
+</body>
+</html>
